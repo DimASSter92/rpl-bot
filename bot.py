@@ -5,10 +5,9 @@ import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from understatapi import UnderstatClient
 from aiohttp import web
 
 # === НАСТРОЙКИ ===
@@ -73,6 +72,21 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
+# === КЛАВИАТУРА ДЛЯ ВЫБОРА СЧЁТА ===
+def get_score_keyboard(match_id: int):
+    keyboard = InlineKeyboardMarkup(row_width=4)
+    buttons = []
+    for s1 in range(0, 5):
+        for s2 in range(0, 5):
+            buttons.append(
+                InlineKeyboardButton(
+                    f"{s1}:{s2}",
+                    callback_data=f"predict_{match_id}_{s1}_{s2}"
+                )
+            )
+    keyboard.add(*buttons[:12])
+    return keyboard
+
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def get_or_create_user(message: Message):
     user = session.query(User).filter_by(telegram_id=message.from_user.id).first()
@@ -92,6 +106,24 @@ def get_or_create_user(message: Message):
         session.commit()
     return user
 
+def get_user_by_callback(callback: CallbackQuery):
+    user = session.query(User).filter_by(telegram_id=callback.from_user.id).first()
+    if not user:
+        league = session.query(League).first()
+        if not league:
+            league = League(name="РПЛ 2026/27", created_by=ADMIN_ID)
+            session.add(league)
+            session.commit()
+        user = User(
+            telegram_id=callback.from_user.id,
+            username=callback.from_user.username or "",
+            full_name=callback.from_user.full_name or "",
+            league_id=league.id
+        )
+        session.add(user)
+        session.commit()
+    return user
+
 def calculate_match_points(pred: Prediction, match: Match) -> int:
     points = 0
     pred_winner = 1 if pred.pred_score1 > pred.pred_score2 else (2 if pred.pred_score1 < pred.pred_score2 else 0)
@@ -103,67 +135,6 @@ def calculate_match_points(pred: Prediction, match: Match) -> int:
         points = 1
     return points
 
-# === АВТОМАТИЧЕСКОЕ ПОЛУЧЕНИЕ МАТЧЕЙ ===
-async def check_and_update_matches():
-    try:
-        with UnderstatClient() as understat:
-            league_data = understat.league(league="RFPL").get_match_data(season="2026")
-            
-            if not league_data:
-                logging.info("Нет данных о матчах РПЛ")
-                return
-            
-            for match_data in league_data:
-                existing_match = session.query(Match).filter_by(
-                    team1=match_data.get('h', {}).get('title', ''),
-                    team2=match_data.get('a', {}).get('title', '')
-                ).first()
-                
-                is_finished = match_data.get('isResult', False) or match_data.get('status') == 'Finished'
-                
-                if existing_match:
-                    if is_finished and not existing_match.finished:
-                        home_score = match_data.get('goals', {}).get('h', 0)
-                        away_score = match_data.get('goals', {}).get('a', 0)
-                        existing_match.score1 = home_score
-                        existing_match.score2 = away_score
-                        existing_match.finished = True
-                        session.commit()
-                        await process_match_results(existing_match)
-                        logging.info(f"✅ Матч завершён: {existing_match.team1} {home_score}:{away_score} {existing_match.team2}")
-                else:
-                    match = Match(
-                        team1=match_data.get('h', {}).get('title', 'Unknown'),
-                        team2=match_data.get('a', {}).get('title', 'Unknown'),
-                        match_date=datetime.now(),
-                        finished=is_finished
-                    )
-                    if is_finished:
-                        match.score1 = match_data.get('goals', {}).get('h', 0)
-                        match.score2 = match_data.get('goals', {}).get('a', 0)
-                    session.add(match)
-                    session.commit()
-                    logging.info(f"✅ Добавлен матч: {match.team1} ⚔️ {match.team2}")
-                    
-    except Exception as e:
-        logging.error(f"Ошибка при получении данных: {e}")
-
-async def process_match_results(match: Match):
-    predictions = session.query(Prediction).filter_by(match_id=match.id).all()
-    for p in predictions:
-        points = calculate_match_points(p, match)
-        p.points_earned = points
-        user = session.query(User).filter_by(id=p.user_id).first()
-        if user:
-            user.points += points
-    session.commit()
-    logging.info(f"🎯 Начислены очки за матч {match.team1} - {match.team2}")
-
-async def periodic_check():
-    while True:
-        await check_and_update_matches()
-        await asyncio.sleep(300)
-
 # === КОМАНДЫ БОТА ===
 
 @dp.message(Command("start"))
@@ -172,40 +143,78 @@ async def start_command(message: Message):
     await message.answer(
         "⚽ *Добро пожаловать в конкурс прогнозов РПЛ 2026/27!*\n\n"
         "📋 *Доступные команды:*\n"
-        "/matches — список матчей\n"
-        "/predict X Y — прогноз (пример: /predict 2 1)\n"
-        "/mypredictions — мои прогнозы\n"
+        "/matches — список матчей (будущие и прошедшие)\n"
         "/rating — таблица лидеров\n"
+        "/mypredictions — мои прогнозы\n"
         "/champion [команда] — прогноз на чемпиона (+10 очков)\n"
         "/relegation [команда1, команда2] — прогноз на вылет (+5 за каждую)\n"
-        "/myseason — мои сезонные прогнозы\n"
-        "/help — правила",
+        "/help — правила игры\n\n"
+        "👑 *Админ-команды:*\n"
+        "/addmatch Т1 Т2 ДД.ММ.ГГГГ ЧЧ:ММ — добавить матч\n"
+        "/setresult ID S1 S2 — ввести результат\n"
+        "/setchampion [команда] — установить чемпиона\n"
+        "/setrelegated [команда1, команда2] — установить вылетевших",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
     await message.answer(
-        "⚽ *Правила:*\n"
-        "• Точный счет — 3 очка\n"
-        "• Угаданный исход — 1 очко\n"
+        "⚽ *Правила игры:*\n\n"
+        "📌 *Прогнозы на матчи:*\n"
+        "• Точный счёт — 3 очка\n"
+        "• Угаданный исход (победа/ничья) — 1 очко\n\n"
+        "🏆 *Сезонные прогнозы:*\n"
         "• Чемпион — +10 очков\n"
         "• Каждая угаданная команда на вылет — +5 очков\n\n"
-        "🤖 Матчи и результаты подгружаются автоматически с Understat!",
+        "📝 *Как сделать прогноз:*\n"
+        "1. Используйте команду `/predict X Y` (например, `/predict 2 1`)\n"
+        "2. Или выберите матч в `/matches` и нажмите на счёт",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("matches"))
 async def list_matches(message: Message):
-    matches = session.query(Match).filter_by(finished=False).order_by(Match.match_date).all()
-    if not matches:
-        await message.answer("📭 Нет активных матчей. Подождите, данные загружаются автоматически.")
-        return
-    text = "📅 *Матчи:*\n\n"
-    for i, m in enumerate(matches, 1):
-        date_str = m.match_date.strftime("%d.%m %H:%M") if m.match_date else "Дата не указана"
-        text += f"{i}. {m.team1} ⚔️ {m.team2} ({date_str}) | ID: `{m.id}`\n"
-    await message.answer(text, parse_mode="Markdown")
+    user = get_or_create_user(message)
+    
+    # Будущие матчи
+    future_matches = session.query(Match).filter_by(finished=False).order_by(Match.match_date).all()
+    # Прошедшие матчи (последние 10)
+    past_matches = session.query(Match).filter_by(finished=True).order_by(Match.match_date.desc()).limit(10).all()
+    
+    # === БУДУЩИЕ МАТЧИ ===
+    if future_matches:
+        text = "🔮 *Будущие матчи:*\n\n"
+        for m in future_matches:
+            date_str = m.match_date.strftime("%d.%m %H:%M") if m.match_date else "Дата не указана"
+            pred = session.query(Prediction).filter_by(user_id=user.id, match_id=m.id).first()
+            status = f"✅ {pred.pred_score1}:{pred.pred_score2}" if pred else "❌ Нет прогноза"
+            text += f"• {m.team1} ⚔️ {m.team2} ({date_str}) — {status}\n"
+        
+        # Кнопки для выбора матча для прогноза
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        for m in future_matches[:5]:
+            keyboard.add(
+                InlineKeyboardButton(
+                    f"📝 {m.team1} ⚔️ {m.team2}",
+                    callback_data=f"select_predict_{m.id}"
+                )
+            )
+        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message.answer("📭 Нет будущих матчей. Добавьте через /addmatch")
+    
+    # === ПРОШЕДШИЕ МАТЧИ ===
+    if past_matches:
+        text = "\n\n✅ *Прошедшие матчи:*\n\n"
+        for m in past_matches:
+            date_str = m.match_date.strftime("%d.%m %H:%M") if m.match_date else "Дата не указана"
+            pred = session.query(Prediction).filter_by(user_id=user.id, match_id=m.id).first()
+            if pred:
+                text += f"• {m.team1} {m.score1}:{m.score2} {m.team2} ({date_str}) — Очки: {pred.points_earned}\n"
+            else:
+                text += f"• {m.team1} {m.score1}:{m.score2} {m.team2} ({date_str}) — ❌ Нет прогноза\n"
+        await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("predict"))
 async def make_prediction(message: Message):
@@ -219,10 +228,13 @@ async def make_prediction(message: Message):
     except ValueError:
         await message.answer("❌ Введите числа.")
         return
+    
+    # Ближайший будущий матч
     match = session.query(Match).filter_by(finished=False).order_by(Match.match_date).first()
     if not match:
-        await message.answer("❌ Нет матчей для прогноза. Подождите, данные загружаются.")
+        await message.answer("❌ Нет будущих матчей. Добавьте через /addmatch")
         return
+    
     existing = session.query(Prediction).filter_by(user_id=user.id, match_id=match.id).first()
     if existing:
         existing.pred_score1 = s1
@@ -231,20 +243,20 @@ async def make_prediction(message: Message):
         pred = Prediction(user_id=user.id, match_id=match.id, pred_score1=s1, pred_score2=s2)
         session.add(pred)
     session.commit()
-    await message.answer(f"✅ Прогноз: {match.team1} {s1}:{s2} {match.team2}")
+    await message.answer(f"✅ Прогноз сохранён: {match.team1} {s1}:{s2} {match.team2}")
 
 @dp.message(Command("mypredictions"))
 async def my_predictions(message: Message):
     user = get_or_create_user(message)
     preds = session.query(Prediction).join(Match).filter(Prediction.user_id == user.id).all()
     if not preds:
-        await message.answer("📭 Нет прогнозов.")
+        await message.answer("📭 У вас нет прогнозов.")
         return
-    text = "📋 *Мои прогнозы:*\n\n"
+    text = "📋 *Ваши прогнозы:*\n\n"
     for p in preds:
         status = "✅ Завершён" if p.match.finished else "⏳ Ожидает"
         result_str = f"{p.match.score1}:{p.match.score2}" if p.match.finished else "?"
-        text += f"{p.match.team1} {p.pred_score1}:{p.pred_score2} {p.match.team2} | Результат: {result_str} | Очки: {p.points_earned} | {status}\n"
+        text += f"• {p.match.team1} {p.pred_score1}:{p.pred_score2} {p.match.team2} | Результат: {result_str} | Очки: {p.points_earned} | {status}\n"
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("rating"))
@@ -311,7 +323,10 @@ async def add_match(message: Message):
         return
     parts = message.text.split(maxsplit=3)
     if len(parts) != 4:
-        await message.answer("❌ Формат: `/addmatch Команда1 Команда2 ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `/addmatch Зенит Спартак 24.07.2026 20:00`")
+        await message.answer(
+            "❌ Формат: `/addmatch Команда1 Команда2 ДД.ММ.ГГГГ ЧЧ:ММ`\n"
+            "Пример: `/addmatch Зенит Спартак 24.07.2026 20:00`"
+        )
         return
     try:
         team1, team2 = parts[1], parts[2]
@@ -337,7 +352,7 @@ async def set_result(message: Message):
         s1, s2 = int(parts[2]), int(parts[3])
         match = session.query(Match).filter_by(id=match_id).first()
         if not match:
-            await message.answer("❌ Матч не найден.")
+            await message.answer("❌ Матч не найден. Используйте ID из `/matches`")
             return
         match.score1 = s1
         match.score2 = s2
@@ -351,7 +366,10 @@ async def set_result(message: Message):
             if user:
                 user.points += points
         session.commit()
-        await message.answer(f"✅ Результат: {match.team1} {s1}:{s2} {match.team2}\n🎯 Очки начислены!")
+        await message.answer(
+            f"✅ Результат: {match.team1} {s1}:{s2} {match.team2}\n"
+            f"🎯 Начислено очков: {len(predictions)} игрокам!"
+        )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
@@ -366,11 +384,13 @@ async def set_champion_result(message: Message):
         return
     champion = parts[1].strip()
     users = session.query(User).all()
+    count = 0
     for user in users:
         if user.champion == champion:
             user.points += 10
+            count += 1
     session.commit()
-    await message.answer(f"✅ Чемпион: *{champion}* (+10 очков угадавшим)", parse_mode="Markdown")
+    await message.answer(f"✅ Чемпион: *{champion}*\n🎯 +10 очков получили {count} игроков!", parse_mode="Markdown")
 
 @dp.message(Command("setrelegated"))
 async def set_relegated_result(message: Message):
@@ -386,14 +406,93 @@ async def set_relegated_result(message: Message):
         await message.answer("❌ Укажите ровно 2 команды.")
         return
     users = session.query(User).all()
+    count = 0
     for user in users:
         if user.relegated_teams:
             user_teams = json.loads(user.relegated_teams)
             for team in user_teams:
                 if team in relegated:
                     user.points += 5
+                    count += 1
     session.commit()
-    await message.answer(f"✅ Вылетевшие: *{relegated[0]}, {relegated[1]}* (+5 за каждую)", parse_mode="Markdown")
+    await message.answer(
+        f"✅ Вылетевшие: *{relegated[0]}, {relegated[1]}*\n"
+        f"🎯 +5 очков за каждую угаданную команду получили {count} игроков!",
+        parse_mode="Markdown"
+    )
+
+# === ОБРАБОТЧИК КНОПОК ===
+
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    data = callback.data
+    user = get_user_by_callback(callback)
+    
+    if data.startswith("select_predict_"):
+        match_id = int(data.split("_")[2])
+        match = session.query(Match).filter_by(id=match_id, finished=False).first()
+        
+        if not match:
+            await callback.message.edit_text("❌ Этот матч уже завершён или не найден.")
+            await callback.answer()
+            return
+        
+        existing = session.query(Prediction).filter_by(
+            user_id=user.id,
+            match_id=match.id
+        ).first()
+        
+        text = f"📝 *Прогноз на матч:*\n\n"
+        text += f"{match.team1} ⚔️ {match.team2}\n\n"
+        if existing:
+            text += f"Ваш текущий прогноз: *{existing.pred_score1}:{existing.pred_score2}*\n\n"
+        text += "Выберите счёт:"
+        
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_score_keyboard(match.id),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    elif data.startswith("predict_"):
+        parts = data.split("_")
+        match_id = int(parts[1])
+        s1, s2 = int(parts[2]), int(parts[3])
+        
+        match = session.query(Match).filter_by(id=match_id).first()
+        if not match or match.finished:
+            await callback.message.edit_text("❌ Этот матч уже завершён.")
+            await callback.answer()
+            return
+        
+        existing = session.query(Prediction).filter_by(
+            user_id=user.id,
+            match_id=match.id
+        ).first()
+        
+        if existing:
+            existing.pred_score1 = s1
+            existing.pred_score2 = s2
+        else:
+            pred = Prediction(
+                user_id=user.id,
+                match_id=match.id,
+                pred_score1=s1,
+                pred_score2=s2
+            )
+            session.add(pred)
+        session.commit()
+        
+        await callback.message.edit_text(
+            f"✅ *Прогноз сохранён!*\n\n"
+            f"{match.team1} *{s1}:{s2}* {match.team2}\n\n"
+            f"🏆 Точный счёт: +3 очка\n"
+            f"✅ Угаданный исход: +1 очко"
+        )
+        await callback.answer()
+        return
 
 # === ЗАПУСК ===
 async def start_bot():
@@ -403,7 +502,6 @@ async def health_check(request):
     return web.Response(text="✅ Бот работает!")
 
 async def main():
-    asyncio.create_task(periodic_check())
     asyncio.create_task(start_bot())
     
     app = web.Application()
