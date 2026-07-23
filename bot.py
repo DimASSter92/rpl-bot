@@ -223,21 +223,30 @@ async def predict_command(message: Message):
     user = get_or_create_user(message)
     now = datetime.now()
     
+    # Отправляем сообщение, что начали обработку
+    await message.answer("⏳ Загружаю список матчей...")
+    
     # === МОИ ПРОГНОЗЫ ===
     my_predictions = session.query(Prediction).join(Match).filter(
         Prediction.user_id == user.id,
         Match.finished == False
     ).all()
     
+    # Логируем количество прогнозов
+    logging.info(f"Пользователь {user.id}: найдено {len(my_predictions)} прогнозов")
+    
     text = "📋 *Мои прогнозы:*\n\n"
     keyboard = InlineKeyboardMarkup(row_width=1)
     
+    # === Если есть прогнозы ===
     if my_predictions:
         for p in my_predictions:
             match = p.match
+            if not match:
+                logging.warning(f"Прогноз {p.id} без матча!")
+                continue
+                
             date_str = match.match_date.strftime("%d.%m %H:%M") if match.match_date else "Дата не указана"
-            
-            # Проверяем, можно ли изменить прогноз (до начала матча)
             can_edit = match.match_date > now if match.match_date else False
             edit_icon = "✏️" if can_edit else "🔒"
             
@@ -253,19 +262,24 @@ async def predict_command(message: Message):
     else:
         text += "📭 У вас нет активных прогнозов.\n"
     
-    # === ДОСТУПНЫЕ МАТЧИ ДЛЯ ПРОГНОЗА ===
+    # === ДОСТУПНЫЕ МАТЧИ ===
+    predicted_ids = [p.match_id for p in my_predictions]
+    
+    logging.info(f"Поиск доступных матчей...")
     available_matches = session.query(Match).filter(
         Match.finished == False,
         Match.match_date > now
     ).all()
     
-    # Убираем матчи, на которые уже есть прогноз
-    predicted_ids = [p.match_id for p in my_predictions]
+    logging.info(f"Найдено доступных матчей: {len(available_matches)}")
+    
+    # Фильтруем матчи
     available_matches = [m for m in available_matches if m.id not in predicted_ids]
+    logging.info(f"После фильтрации осталось: {len(available_matches)}")
     
     if available_matches:
         text += "\n🔮 *Доступные матчи для прогноза:*\n\n"
-        for m in available_matches[:10]:  # Ограничим 10 матчами
+        for m in available_matches[:10]:
             date_str = m.match_date.strftime("%d.%m %H:%M") if m.match_date else "Дата не указана"
             text += f"• {m.team1} ⚔️ {m.team2} ({date_str})\n"
             keyboard.add(
@@ -275,8 +289,12 @@ async def predict_command(message: Message):
                 )
             )
     else:
-        text += "\n✅ Все доступные матчи уже имеют прогнозы!"
+        if my_predictions:
+            text += "\n✅ Все доступные матчи уже имеют прогнозы!"
+        else:
+            text += "\n📭 Нет доступных матчей для прогноза. Добавьте матчи через /addmatch"
     
+    # Отправляем результат
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 # === КОМАНДА /RESULTS (ПРОШЕДШИЕ МАТЧИ) ===
