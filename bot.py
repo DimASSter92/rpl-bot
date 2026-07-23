@@ -16,7 +16,7 @@ API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not API_TOKEN:
     API_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
 
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 123456789))  # ЗАМЕНИТЕ НА ВАШ ID
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 378215323))  # ЗАМЕНИТЕ НА ВАШ ID
 
 # === БАЗА ДАННЫХ ===
 engine = create_engine('sqlite:///predictions.db', echo=False)
