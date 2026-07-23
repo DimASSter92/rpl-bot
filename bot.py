@@ -14,9 +14,9 @@ from aiohttp import web
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not API_TOKEN:
-    API_TOKEN = "8652653127:AAGb1IxflwwjpO3N6LJHNs5yOS21Le3W57c"
+    API_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
 
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 378215323))  # ЗАМЕНИТЕ НА ВАШ ID
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 378215323))
 
 # === БАЗА ДАННЫХ ===
 engine = create_engine('sqlite:///predictions.db', echo=False)
@@ -68,15 +68,13 @@ class Prediction(Base):
 
 Base.metadata.create_all(engine)
 
-# === ИНИЦИАЛИЗАЦИЯ БОТА ===
+# === ИНИЦИАЛИЗАЦИЯ ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# === КЛАВИАТУРЫ (КНОПКИ) ===
-
+# === КНОПКИ ===
 def get_main_menu():
-    """Главное меню"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     buttons = [
         InlineKeyboardButton("📅 Расписание", callback_data="menu_matches"),
@@ -90,26 +88,21 @@ def get_main_menu():
     return keyboard
 
 def get_match_predict_keyboard(match_id: int):
-    """Клавиатура для прогноза счёта"""
     keyboard = InlineKeyboardMarkup(row_width=4)
     buttons = []
-    for s1 in range(0, 6):
-        for s2 in range(0, 6):
+    for s1 in range(0, 5):
+        for s2 in range(0, 5):
             buttons.append(
                 InlineKeyboardButton(
                     f"{s1}:{s2}", 
                     callback_data=f"predict_{match_id}_{s1}_{s2}"
                 )
             )
-    # Добавляем только первые 12 кнопок, чтобы не перегружать
     keyboard.add(*buttons[:12])
-    keyboard.add(
-        InlineKeyboardButton("🔙 Назад", callback_data="menu_back")
-    )
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="menu_back"))
     return keyboard
 
 def get_back_keyboard():
-    """Клавиатура с кнопкой 'Назад'"""
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="menu_back"))
     return keyboard
@@ -223,8 +216,7 @@ async def periodic_check():
         await check_and_update_matches()
         await asyncio.sleep(300)
 
-# === КОМАНДЫ БОТА ===
-
+# === КОМАНДА /START ===
 @dp.message(Command("start"))
 async def start_command(message: Message):
     get_or_create_user(message)
@@ -243,7 +235,7 @@ async def help_command(message: Message):
         "• Угаданный исход — 1 очко\n"
         "• Чемпион — +10 очков\n"
         "• Каждая угаданная команда на вылет — +5 очков\n\n"
-        "🤖 Матчи и результаты подгружаются автоматически с Understat!",
+        "🤖 Матчи и результаты подгружаются автоматически!",
         reply_markup=get_back_keyboard(),
         parse_mode="Markdown"
     )
@@ -255,7 +247,7 @@ async def add_match(message: Message):
         return
     parts = message.text.split(maxsplit=3)
     if len(parts) != 4:
-        await message.answer("❌ Формат: `/addmatch Команда1 Команда2 ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `/addmatch Зенит Спартак 24.07.2026 20:00`")
+        await message.answer("❌ Формат: `/addmatch Команда1 Команда2 ДД.ММ.ГГГГ ЧЧ:ММ`")
         return
     try:
         team1, team2 = parts[1], parts[2]
@@ -339,14 +331,12 @@ async def set_relegated_result(message: Message):
     session.commit()
     await message.answer(f"✅ Вылетевшие: *{relegated[0]}, {relegated[1]}* (+5 за каждую)", parse_mode="Markdown")
 
-# === ОБРАБОТЧИКИ КНОПОК ===
-
+# === ОБРАБОТЧИК КНОПОК ===
 @dp.callback_query()
 async def handle_callback(callback: CallbackQuery):
     data = callback.data
     user = get_user_by_callback(callback)
     
-    # === ГЛАВНОЕ МЕНЮ ===
     if data == "menu_back":
         await callback.message.edit_text(
             "⚽ *Главное меню*\n\nВыберите действие:",
@@ -487,7 +477,6 @@ async def handle_callback(callback: CallbackQuery):
         await callback.answer()
         return
     
-    # === ВЫБОР МАТЧА ДЛЯ ПРОГНОЗА ===
     elif data.startswith("select_predict_"):
         match_id = int(data.split("_")[2])
         match = session.query(Match).filter_by(id=match_id, finished=False).first()
@@ -500,7 +489,6 @@ async def handle_callback(callback: CallbackQuery):
             await callback.answer()
             return
         
-        # Проверяем, есть ли уже прогноз
         existing = session.query(Prediction).filter_by(
             user_id=user.id, 
             match_id=match.id
@@ -520,7 +508,6 @@ async def handle_callback(callback: CallbackQuery):
         await callback.answer()
         return
     
-    # === ПРОГНОЗ СЧЁТА ===
     elif data.startswith("predict_"):
         parts = data.split("_")
         match_id = int(parts[1])
@@ -535,7 +522,6 @@ async def handle_callback(callback: CallbackQuery):
             await callback.answer()
             return
         
-        # Сохраняем прогноз
         existing = session.query(Prediction).filter_by(
             user_id=user.id, 
             match_id=match.id
@@ -573,13 +559,9 @@ async def health_check(request):
     return web.Response(text="✅ Бот работает!")
 
 async def main():
-    # Запускаем фоновую проверку матчей
     asyncio.create_task(periodic_check())
-    
-    # Запускаем бота в фоне
     asyncio.create_task(start_bot())
     
-    # Запускаем веб-сервер для Render
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
