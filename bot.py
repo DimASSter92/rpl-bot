@@ -106,8 +106,8 @@ def calculate_match_points(pred: Prediction, match: Match) -> int:
 # === АВТОМАТИЧЕСКОЕ ПОЛУЧЕНИЕ МАТЧЕЙ ===
 async def check_and_update_matches():
     try:
-        async with UnderstatClient() as understat:
-            league_data = await understat.league(league="RFPL").get_match_data(season="2026")
+        with UnderstatClient() as understat:
+    league_data = understat.league(league="RFPL").get_match_data(season="2026")
             
             if not league_data:
                 logging.info("Нет данных о матчах РПЛ")
