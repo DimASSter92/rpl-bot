@@ -8,13 +8,15 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from understatapi import UnderstatClient
+from aiohttp import web
 
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not API_TOKEN:
-    API_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"  # Запасной вариант
+    API_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
 
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 378215323))  # ЗАМЕНИТЕ НА ВАШ ID
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 123456789))  # ЗАМЕНИТЕ НА ВАШ ID
 
 # === БАЗА ДАННЫХ ===
 engine = create_engine('sqlite:///predictions.db', echo=False)
@@ -101,8 +103,68 @@ def calculate_match_points(pred: Prediction, match: Match) -> int:
         points = 1
     return points
 
-# === КОМАНДЫ ===
+# === АВТОМАТИЧЕСКОЕ ПОЛУЧЕНИЕ МАТЧЕЙ ===
+async def check_and_update_matches():
+    try:
+        async with UnderstatClient() as understat:
+            league_data = await understat.league(league="RFPL").get_match_data(season="2026")
+            
+            if not league_data:
+                logging.info("Нет данных о матчах РПЛ")
+                return
+            
+            for match_data in league_data:
+                existing_match = session.query(Match).filter_by(
+                    team1=match_data.get('h', {}).get('title', ''),
+                    team2=match_data.get('a', {}).get('title', '')
+                ).first()
+                
+                is_finished = match_data.get('isResult', False) or match_data.get('status') == 'Finished'
+                
+                if existing_match:
+                    if is_finished and not existing_match.finished:
+                        home_score = match_data.get('goals', {}).get('h', 0)
+                        away_score = match_data.get('goals', {}).get('a', 0)
+                        existing_match.score1 = home_score
+                        existing_match.score2 = away_score
+                        existing_match.finished = True
+                        session.commit()
+                        await process_match_results(existing_match)
+                        logging.info(f"✅ Матч завершён: {existing_match.team1} {home_score}:{away_score} {existing_match.team2}")
+                else:
+                    match = Match(
+                        team1=match_data.get('h', {}).get('title', 'Unknown'),
+                        team2=match_data.get('a', {}).get('title', 'Unknown'),
+                        match_date=datetime.now(),
+                        finished=is_finished
+                    )
+                    if is_finished:
+                        match.score1 = match_data.get('goals', {}).get('h', 0)
+                        match.score2 = match_data.get('goals', {}).get('a', 0)
+                    session.add(match)
+                    session.commit()
+                    logging.info(f"✅ Добавлен матч: {match.team1} ⚔️ {match.team2}")
+                    
+    except Exception as e:
+        logging.error(f"Ошибка при получении данных: {e}")
 
+async def process_match_results(match: Match):
+    predictions = session.query(Prediction).filter_by(match_id=match.id).all()
+    for p in predictions:
+        points = calculate_match_points(p, match)
+        p.points_earned = points
+        user = session.query(User).filter_by(id=p.user_id).first()
+        if user:
+            user.points += points
+    session.commit()
+    logging.info(f"🎯 Начислены очки за матч {match.team1} - {match.team2}")
+
+async def periodic_check():
+    while True:
+        await check_and_update_matches()
+        await asyncio.sleep(300)
+
+# === КОМАНДЫ БОТА ===
 @dp.message(Command("start"))
 async def start_command(message: Message):
     get_or_create_user(message)
@@ -116,8 +178,6 @@ async def start_command(message: Message):
         "/champion [команда] — прогноз на чемпиона (+10 очков)\n"
         "/relegation [команда1, команда2] — прогноз на вылет (+5 за каждую)\n"
         "/myseason — мои сезонные прогнозы\n"
-        "/addmatch Т1 Т2 ДД.ММ.ГГГГ ЧЧ:ММ — админ: добавить матч\n"
-        "/setresult ID S1 S2 — админ: установить результат\n"
         "/setchampion [команда] — админ: установить чемпиона\n"
         "/setrelegated [команда1, команда2] — админ: установить вылетевших\n"
         "/help — правила",
@@ -131,7 +191,8 @@ async def help_command(message: Message):
         "• Точный счет — 3 очка\n"
         "• Угаданный исход — 1 очко\n"
         "• Чемпион — +10 очков\n"
-        "• Каждая угаданная команда на вылет — +5 очков",
+        "• Каждая угаданная команда на вылет — +5 очков\n\n"
+        "🤖 Матчи и результаты подгружаются автоматически с Understat!",
         parse_mode="Markdown"
     )
 
@@ -139,7 +200,7 @@ async def help_command(message: Message):
 async def list_matches(message: Message):
     matches = session.query(Match).filter_by(finished=False).order_by(Match.match_date).all()
     if not matches:
-        await message.answer("📭 Нет активных матчей. Добавьте через /addmatch")
+        await message.answer("📭 Нет активных матчей. Подождите, данные загружаются автоматически.")
         return
     text = "📅 *Матчи:*\n\n"
     for i, m in enumerate(matches, 1):
@@ -161,7 +222,7 @@ async def make_prediction(message: Message):
         return
     match = session.query(Match).filter_by(finished=False).order_by(Match.match_date).first()
     if not match:
-        await message.answer("❌ Нет матчей для прогноза. Добавьте через /addmatch")
+        await message.answer("❌ Нет матчей для прогноза. Подождите, данные загружаются.")
         return
     existing = session.query(Prediction).filter_by(user_id=user.id, match_id=match.id).first()
     if existing:
@@ -243,58 +304,6 @@ async def my_season_predictions(message: Message):
     await message.answer(text, parse_mode="Markdown")
 
 # === АДМИН-КОМАНДЫ ===
-
-@dp.message(Command("addmatch"))
-async def add_match(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
-    parts = message.text.split(maxsplit=3)
-    if len(parts) != 4:
-        await message.answer("❌ Формат: `/addmatch Команда1 Команда2 ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `/addmatch Зенит Спартак 24.07.2026 20:00`")
-        return
-    try:
-        team1, team2 = parts[1], parts[2]
-        dt = datetime.strptime(parts[3], "%d.%m.%Y %H:%M")
-        match = Match(team1=team1, team2=team2, match_date=dt)
-        session.add(match)
-        session.commit()
-        await message.answer(f"✅ Матч добавлен: {team1} ⚔️ {team2} ({parts[3]})")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-@dp.message(Command("setresult"))
-async def set_result(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Только для администратора.")
-        return
-    parts = message.text.split()
-    if len(parts) != 4:
-        await message.answer("❌ Формат: `/setresult ID_матча голы1 голы2`")
-        return
-    try:
-        match_id = int(parts[1])
-        s1, s2 = int(parts[2]), int(parts[3])
-        match = session.query(Match).filter_by(id=match_id).first()
-        if not match:
-            await message.answer("❌ Матч не найден.")
-            return
-        match.score1 = s1
-        match.score2 = s2
-        match.finished = True
-        
-        predictions = session.query(Prediction).filter_by(match_id=match.id).all()
-        for p in predictions:
-            points = calculate_match_points(p, match)
-            p.points_earned = points
-            user = session.query(User).filter_by(id=p.user_id).first()
-            if user:
-                user.points += points
-        session.commit()
-        await message.answer(f"✅ Результат: {match.team1} {s1}:{s2} {match.team2}\n🎯 Очки начислены!")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
 @dp.message(Command("setchampion"))
 async def set_champion_result(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -335,9 +344,36 @@ async def set_relegated_result(message: Message):
     session.commit()
     await message.answer(f"✅ Вылетевшие: *{relegated[0]}, {relegated[1]}* (+5 за каждую)", parse_mode="Markdown")
 
-# === ЗАПУСК ===
-async def main():
+# === ЗАПУСК БОТА И ВЕБ-СЕРВЕРА ===
+async def start_bot():
+    """Запускает бота"""
     await dp.start_polling(bot)
+
+async def health_check(request):
+    """Эндпоинт для проверки здоровья бота"""
+    return web.Response(text="✅ Бот работает!")
+
+async def main():
+    # Запускаем фоновую проверку матчей
+    asyncio.create_task(periodic_check())
+    
+    # Запускаем бота в фоне
+    asyncio.create_task(start_bot())
+    
+    # Запускаем веб-сервер для Render
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    port = int(os.environ.get('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"✅ Веб-сервер запущен на порту {port}")
+    
+    # Держим сервер запущенным
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
