@@ -417,12 +417,10 @@ async def main():
     await site.start()
     logging.info(f"✅ Веб-сервер запущен на порту {port}")
     
-    await asyncio.Event().wait()
+    # Бесконечное ожидание, чтобы бот работал постоянно
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
     
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
