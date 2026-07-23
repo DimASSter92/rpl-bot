@@ -14,7 +14,7 @@ from aiohttp import web
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not API_TOKEN:
-    API_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
+    API_TOKEN = "8652653127:AAFS8OrY-p7MmaDP0Qb4NZJedXau1EapuiE"
 
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 378215323))
 
